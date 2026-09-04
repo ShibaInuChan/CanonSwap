@@ -39,7 +39,7 @@ class CanSwapPipeline(object):
     def __init__(self, inference_cfg: InferenceConfig, crop_cfg: CropConfig):
         self.can_swapper: can_swapper = can_swapper(inference_cfg=inference_cfg)
         self.cropper: Cropper = Cropper(crop_cfg=crop_cfg)
-        self.soft_mask = SoftErosion(kernel_size=21, threshold=0.9, iterations=3).cuda()
+        self.soft_mask = SoftErosion(kernel_size=21, threshold=0.9, iterations=3).to(self.can_swapper.device)
         self.ID_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -174,20 +174,24 @@ class CanSwapPipeline(object):
             driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_lst]  # force to resize to 256x256
         #######################################
         #获取mask
+        # NOTE: the SegFormer-based semantic mask (face-parsing model) produced
+        # scattered noise instead of a face-shaped region in testing (root cause
+        # not isolated). Replaced with a landmark-based convex-hull mask, using
+        # the landmarks CanonSwap already computes correctly for cropping/motion.
+        # driving_lmk_crop_lst, despite its name, holds ORIGINAL full-frame pixel
+        # coordinates (crop_source_video computes `lmk` on the full frame and
+        # never re-expresses it in crop-local coordinates) arbitrarily scaled by
+        # 256/crop_cfg.dsize; undo that scale to recover full-frame coordinates,
+        # and build the mask directly at full-frame resolution so no further
+        # crop-to-original warp is needed for it.
         masks = []
+        h_full, w_full = driving_rgb_lst[0].shape[:2]
         for i in track(range(n_frames), description='🚀Parsing...', total=n_frames):
-            frame = driving_rgb_crop_256x256_lst[i]
-            inputs = self.image_processor(frame, return_tensors="pt").to(device)
-            outputs = self.model(**inputs)
-            logits = outputs.logits # tensor of shape (N, 19, H, W)
-            upsampled_logits = torch.nn.functional.interpolate( #N, 19, 256, 256
-            logits,
-            size= (512, 512),  # H x W
-            mode='bilinear',
-            align_corners=False
-            )
-            labels = upsampled_logits.argmax(dim=1)[0] #N, 256, 256
-            mask = torch.isin(labels, self.valid_list).to(dtype=torch.int)
+            lmk_full = (driving_lmk_crop_lst[i] * (crop_cfg.dsize / 256)).astype(np.int32)
+            mask_np = np.zeros((h_full, w_full), dtype=np.uint8)
+            hull = cv2.convexHull(lmk_full)
+            cv2.fillConvexPoly(mask_np, hull, 1)
+            mask = torch.from_numpy(mask_np).to(dtype=torch.int, device=device)
             masks.append(mask)
 
         ######################################
@@ -244,10 +248,12 @@ class CanSwapPipeline(object):
             f_can, occ_map = self.can_swapper.warping_module.warp(f_s, x_t, x_can)
 
 
-            #for debug
-            rec_can = self.can_swapper.conv_decode(f_can, occ_map)
-            rec_can_i = self.can_swapper.parse_output(rec_can)[0]
-            rec_can_lst.append(rec_can_i)
+            # Skipped for speed: this ran a full extra generator pass (conv_decode)
+            # purely to build the debug reconstruction panel in the _concat.mp4
+            # comparison video, which the actual swap output never uses. Reuse the
+            # driving crop as a cheap placeholder so concat_frames still gets a
+            # same-length list, at no extra generator cost.
+            rec_can_lst.append(driving_rgb_crop_256x256_lst[i])
             #######
             # if i == 0:
             f_can_swap = self.can_swapper.swap_module(f_can, source_id)
@@ -275,10 +281,25 @@ class CanSwapPipeline(object):
                 mask , _ = self.soft_mask(masks[i].unsqueeze(0).unsqueeze(0))
                 # print(mask.shape)
                 mask = mask.squeeze().data.cpu().numpy()
-                mask = np.stack([mask, mask, mask], axis=-1)
-                mask_ori_float = prepare_paste_back(mask, target_M_c2o_lst[i], dsize=(driving_rgb_lst[i].shape[1], driving_rgb_lst[i].shape[0]), if_float=True)
+                # Our landmark-based mask (above) is already built directly at
+                # full-frame resolution, so it no longer needs prepare_paste_back's
+                # crop-to-original warp (that was for the old crop-space SegFormer mask).
+                mask_ori_float = np.stack([mask, mask, mask], axis=-1)
+                if i == 0:
+                    import cv2 as _cv2
+                    _cv2.imwrite('debug_mask.png', (mask_ori_float * 255).astype('uint8'))
+                    print('DEBUG: wrote debug_mask.png, mask max =', mask_ori_float.max(), 'mean =', mask_ori_float.mean())
 
             if inf_cfg.flag_pasteback and inf_cfg.flag_do_crop:
+                if i == 0:
+                    import cv2 as _cv2
+                    from src.utils.crop import _transform_img
+                    _cv2.imwrite('debug_Ip_i.png', _cv2.cvtColor(I_p_i, _cv2.COLOR_RGB2BGR))
+                    _dsize = (driving_rgb_lst[i].shape[1], driving_rgb_lst[i].shape[0])
+                    _warped = _transform_img(I_p_i, target_M_c2o_lst[i], dsize=_dsize)
+                    _cv2.imwrite('debug_Ip_warped.png', _cv2.cvtColor(_warped, _cv2.COLOR_RGB2BGR))
+                    print('DEBUG I_p_i:', I_p_i.dtype, I_p_i.shape, I_p_i.min(), I_p_i.max())
+                    print('DEBUG warped:', _warped.dtype, _warped.shape, _warped.min(), _warped.max())
                 I_p_pstbk = paste_back(I_p_i, target_M_c2o_lst[i], driving_rgb_lst[i], mask_ori_float)
                 I_p_pstbk_lst.append(I_p_pstbk)
 

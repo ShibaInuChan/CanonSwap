@@ -42,7 +42,9 @@ class SoftErosion(torch.nn.Module):
 
         mask = x >= self.threshold
         x[mask] = 1.0
-        x[~mask] /= x[~mask].max()
+        off_mask_max = x[~mask].max() if (~mask).any() else x.new_tensor(0.0)
+        if off_mask_max > 0:
+            x[~mask] = x[~mask] / off_mask_max
 
         return x, mask
 

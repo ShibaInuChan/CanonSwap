@@ -81,7 +81,7 @@ class can_swapper(object):
         #load ID extractor
         netArc = "pretrained_weights/arcface_checkpoint.tar"
         self.netArc = torch.load(netArc, map_location=torch.device("cpu"), weights_only = False)
-        self.netArc.cuda()
+        self.netArc.to(self.device)
         self.netArc.eval()
 
     def load_cpk(self):

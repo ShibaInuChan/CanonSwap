@@ -40,7 +40,7 @@ class CanSwapPipeline(object):
     def __init__(self, inference_cfg: InferenceConfig, crop_cfg: CropConfig):
         self.can_swapper: can_swapper = can_swapper(inference_cfg=inference_cfg)
         self.cropper: Cropper = Cropper(crop_cfg=crop_cfg)
-        self.soft_mask = SoftErosion(kernel_size=21, threshold=0.9, iterations=2).cuda()
+        self.soft_mask = SoftErosion(kernel_size=21, threshold=0.9, iterations=2).to(self.can_swapper.device)
         self.ID_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])

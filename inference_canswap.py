@@ -62,7 +62,8 @@ def main():
             crop_cfg=crop_cfg
         )
 
-    canswap_pipeline.execute(args)
+    with torch.no_grad():
+        canswap_pipeline.execute(args)
 
 
 if __name__ == "__main__":

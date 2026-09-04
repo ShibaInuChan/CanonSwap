@@ -33,3 +33,11 @@ extract_weights.py
 src/utils/dependencies/XPose/models/UniPose/ops/build
 src/utils/dependencies/XPose/models/UniPose/ops/dist
 src/utils/dependencies/XPose/models/UniPose/ops/MultiScaleDeformableAttention.egg-info
+
+# Our additions: local venvs and debug/test artifacts from getting this running on Apple Silicon
+.venv/
+.venv-py39-old/
+debug_*.png
+debug_*.jpg
+source_can_*.jpg
+examples/target_short.mp4
