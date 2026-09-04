@@ -19,6 +19,43 @@ pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url https
 pip install -r requirements.txt
 ```
 
+## Apple Silicon (macOS) Setup
+
+This fork has been patched to run on Apple Silicon Macs (tested with Python 3.11, PyTorch 2.14) using Metal Performance Shaders (MPS) instead of CUDA. The instructions above are written for CUDA/Linux; use the following on macOS instead.
+
+**Requirements:** Python 3.10+. PyTorch's MPS support for `grid_sampler_3d` (used by this model's motion warping) was added in PyTorch 2.9, which in turn requires Python 3.10+.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install torch torchvision torchaudio   # no --index-url: the default macOS build already includes MPS support
+```
+
+Before installing `requirements.txt`, edit it:
+- Remove the `gradio` line (unused by the CLI scripts here).
+- Change `onnxruntime-gpu` to `onnxruntime` (the GPU build is CUDA-only).
+
+```bash
+pip install -r requirements.txt
+brew install ffmpeg   # if not already installed
+```
+
+**Running inference:** set `PYTORCH_ENABLE_MPS_FALLBACK=1` so any operator without an MPS kernel falls back to CPU instead of raising an error.
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1 python inference_canswap.py -s examples/source.jpeg -t examples/target.mp4
+```
+
+**Bugs also fixed in this fork** (unrelated to the CUDA/MPS port — these were pre-existing issues):
+- The SegFormer-based face-parsing mask used for paste-back produced scattered noise instead of a face-shaped region; replaced with a landmark-based convex-hull mask built directly in full-frame coordinates (`src/can_swap_pipeline_e2e.py`).
+- `SoftErosion` (`src/utils/crop.py`) divided by zero when the off-threshold region was uniformly zero (common with a sharp-edged landmark mask), producing NaN that silently corrupted the entire paste-back blend; guarded against a zero denominator.
+- Hardcoded `.cuda()` calls in `src/can_swap_e2e.py`, `src/can_swap_pipeline_e2e.py`, and `src/can_swap_pipeline_v2i.py` replaced with the already-resolved `self.device`.
+- Wrapped the inference call in `torch.no_grad()` (`inference_canswap.py`) — several forward passes in the per-frame loop weren't already covered by an inner `no_grad()`, causing memory to grow unboundedly over the course of a video.
+- Removed a redundant generator pass that only fed the debug `_concat.mp4` comparison video, for a modest speed-up.
+
+**Performance:** even with these fixes, this model is significantly heavier per-frame than lightweight one-shot swappers (e.g. inswapper_128). Expect notably longer processing time on Apple Silicon than on a comparable CUDA GPU. Test on a short clip before processing a full video.
+
 ## Model Download
 
 ### 1. CanonSwap Checkpoints
