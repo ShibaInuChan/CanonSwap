@@ -28,7 +28,6 @@ from torchvision import transforms
 from PIL import Image
 import torch.nn.functional as F
 from .utils.watermark import add_watermark_to_frame_list, add_image_watermark
-from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
 def make_abs_path(fn):
     return osp.join(osp.dirname(osp.realpath(__file__)), fn)
 
@@ -48,10 +47,11 @@ class CanSwapPipeline(object):
         # visualizer_params={"kp_size": 5, "draw_border": True, "colormap": "gist_rainbow"}
         # self.visualizer = Visualizer(**visualizer_params)
 
-        self.image_processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
-        self.model = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing").to(self.can_swapper.device)
-        self.valid_list = [1, 2, 4, 5, 6, 7, 10, 11, 12]
-        self.valid_list = torch.tensor(self.valid_list, device=self.can_swapper.device)
+        # NOTE: the SegFormer face-parsing model (jonathandinu/face-parsing) that
+        # used to be loaded here is no longer used — the paste-back mask is now
+        # built from landmarks (see the masks loop in execute()). Removing this
+        # avoids an unnecessary Hugging Face Hub download on first run and keeps
+        # this fork fully offline after the pretrained_weights/ models are in place.
 
         self.cropper_insightface = Face_detect_crop(name='antelope', root='pretrained_weights/insightface/models')
         self.cropper_insightface.prepare(ctx_id=0, det_thresh=0.5, det_size=(640,640), mode='None')
