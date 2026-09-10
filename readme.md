@@ -57,7 +57,29 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python inference_canswap.py -s examples/source.jpe
 ## Performance
 
 The face-swap pipeline (`inference_canswap.py`) has been reworked for speed. The
-model itself is unchanged — these are all scheduling/precision/IO changes:
+model and its weights are unchanged — these are all scheduling, precision and IO
+changes, so the output is the same.
+
+Measured on an M-series MacBook Air (MPS), 100 frames of 1080p:
+
+| | before | after |
+|---|---|---|
+| swap loop | 421 s | 144 s |
+| target cropping / landmark tracking | ~16 s | 15 s |
+| **total** | **457 s** | **161 s** |
+| per frame | 4.57 s | 1.61 s |
+
+That is **2.8x**. Note the "before" run also wrote the side-by-side comparison
+video, which is now opt-in; asking for it again with
+`--flag_write_concat_video True` gives back some of the difference.
+
+What is left is real arithmetic, not overhead: the network is about 2 TFLOP per
+frame and now runs at roughly 1.4 TFLOPS on that machine, i.e. a decent fraction
+of what the GPU can do. Going substantially faster from here means changing what
+the model computes (a smaller decoder output, fewer blocks) or running on a
+faster GPU, not further scheduling work.
+
+The changes:
 
 - **Half precision (fp16) is now actually used.** `inference_canswap.py` used to
   force it off, and autocast was skipped entirely on MPS, so every run was fp32.
