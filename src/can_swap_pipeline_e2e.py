@@ -426,6 +426,9 @@ class CanSwapPipeline(object):
             if wfp_concat is not None:
                 log(f'Animated image with concat: {wfp_concat}')
 
+        from .modules.fast_conv3d import choice_summary
+        log(choice_summary())
+
         total = sum(v for k, v in timings.items() if not k.startswith(' '))
         log('Timing: ' + ', '.join(f'{k} {v:.1f}s' for k, v in timings.items()) +
             f' | total {total:.1f}s' +

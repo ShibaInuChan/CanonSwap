@@ -128,6 +128,33 @@ def _sync(device):
 
 NATIVE, PER_TAP, FUSED = 'native', 'per-tap', 'fused'
 
+# Every auto-tuning decision, so a run can report what it actually picked.
+_DECISIONS = []
+
+
+def choice_summary(top=10):
+    """What the auto-tuner chose, and what it measured, for each layer/shape."""
+    if not _DECISIONS:
+        return '3D convolutions: nothing auto-tuned (all below the cost threshold, ' \
+               'ineligible, or a path was forced).'
+
+    counts = {}
+    for d in _DECISIONS:
+        counts[d['chosen']] = counts.get(d['chosen'], 0) + 1
+    head = '3D conv paths chosen: ' + ', '.join(f'{k} {v}' for k, v in sorted(counts.items()))
+
+    rows = sorted(_DECISIONS, key=lambda d: -min(v for v in d['ms'].values() if v is not None))[:top]
+    lines = [head, f'  {"layer":<26}{"batch":>6}  ' + ''.join(f'{p:>10}' for p in (NATIVE, PER_TAP, FUSED)) + '   chosen']
+    for d in rows:
+        ms = ''.join((f'{d["ms"][p]:>10.1f}' if d['ms'].get(p) is not None else f'{"-":>10}')
+                     for p in (NATIVE, PER_TAP, FUSED))
+        lines.append(f'  {d["layer"]:<26}{d["shape"][0]:>6}  {ms}   {d["chosen"]}')
+    return '\n'.join(lines)
+
+
+def reset_choices():
+    _DECISIONS.clear()
+
 
 class FastConv3d(nn.Module):
     """Wraps an nn.Conv3d and uses whichever equivalent path is fastest here.
@@ -182,19 +209,36 @@ class FastConv3d(nn.Module):
             (FUSED, lambda: conv3d_via_conv2d_fused(x, w, b, self.w_cat())),
         ]
         best, best_t = NATIVE, None
+        measured = {}
         for name, fn in candidates:
             try:
-                fn()  # warm up (also builds any cached weight)
+                # Two warm-up calls: the first builds any cached weight and
+                # compiles the backend's graph, the second lands on a warm
+                # allocator, so the timed calls measure steady state.
+                fn()
+                fn()
                 _sync(x.device)
                 t0 = time.perf_counter()
                 for _ in range(2):
                     fn()
                 _sync(x.device)
                 elapsed = time.perf_counter() - t0
-            except Exception:
-                continue  # e.g. out of memory for this path; just do not pick it
+            except Exception as e:
+                measured[name] = None  # e.g. out of memory; just do not pick it
+                continue
+            measured[name] = elapsed / 2 * 1000
             if best_t is None or elapsed < best_t:
                 best, best_t = name, elapsed
+
+        k = _tuple3(self.conv.kernel_size)
+        _DECISIONS.append({
+            'layer': f'{self.conv.in_channels}->{self.conv.out_channels} k{k[0]} '
+                     f'{x.shape[2]}x{x.shape[3]}x{x.shape[4]}',
+            'shape': tuple(x.shape),
+            'dtype': str(x.dtype),
+            'ms': measured,
+            'chosen': best,
+        })
         return best
 
     def forward(self, x):

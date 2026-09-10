@@ -187,6 +187,9 @@ def main():
         except RuntimeError as e:
             print(f'\n  batch {bs}: failed ({str(e).splitlines()[0]})')
 
+    from src.modules.fast_conv3d import choice_summary
+    print('\n' + choice_summary(top=12))
+
     if len(results) > 1:
         print('\nbest batch size: -b %d (%.1f ms/frame)' % min(results.items(), key=lambda kv: kv[1]))
 
