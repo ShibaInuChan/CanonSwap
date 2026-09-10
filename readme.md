@@ -98,10 +98,17 @@ The changes:
   frame; they now run over the mask's bounding box, which is a ~10× reduction at
   1080p and more at 4K. The result is identical: the mask is zero everywhere
   outside that box.
-- **Full-resolution frames are no longer accumulated in RAM.** Results are
-  encoded as they are produced instead of being buffered twice (once raw, once
-  watermarked) — several GB saved on a 1080p clip, which on a unified-memory Mac
-  is the difference between running and swapping.
+- **Memory no longer scales with the length of the video.** The whole clip used
+  to be decoded into a list of full-resolution frames before any work started —
+  about 6MB per 1080p frame and 25MB per 4K frame, so a few thousand frames is
+  several GB, enough to take a laptop down. The clip is now streamed: decoded
+  once to track and crop, once more to paste back, holding only one batch of
+  full-resolution frames at a time (and skipping the second pass entirely when
+  paste-back is off). Results are likewise encoded as they are produced rather
+  than buffered twice, once raw and once watermarked.
+- **Results are pasted back onto the right frame.** Frames where no face is
+  detected are dropped by the cropper, which shifted every later result onto the
+  wrong source frame; the cropper now reports which frames it kept.
 - **The identity-modulated convolution weights are cached.** The source identity
   is constant for a whole video, so the 512×512×3×3 modulated kernel used by
   each of the swap module's 14 modulated convolutions is computed once instead
@@ -190,6 +197,11 @@ The first inference run will automatically download the face parsing model.
 python inference_canswap.py -s examples/source.jpeg -t examples/target.mp4
 ```
 This also supports image-to-image swapping.
+
+Note that the network always works on a 512x512 crop of the face, whatever the
+input resolution — a 4K source costs much more in cropping, paste-back and
+encoding without giving the face any more detail. Downscaling a 4K clip to 1080p
+first is usually a good trade.
 
 Useful performance options:
 

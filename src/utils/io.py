@@ -18,6 +18,13 @@ def load_image_rgb(image_path: str):
 
 
 def load_video(video_info, n_frames=-1):
+    """Decode a whole video into a list of frames.
+
+    NOTE: this holds every frame at full resolution in RAM at once -- about
+    6MB per 1080p frame and 25MB per 4K frame, so a couple of thousand frames
+    is several GB. Prefer `stream_video` where the frames can be consumed one
+    at a time.
+    """
     reader = imageio.get_reader(video_info, "ffmpeg")
 
     ret = []
@@ -28,6 +35,35 @@ def load_video(video_info, n_frames=-1):
 
     reader.close()
     return ret
+
+
+def stream_video(video_info, n_frames=-1):
+    """Yield the frames of a video one at a time, keeping none of them.
+
+    The reader is closed even if the consumer stops early.
+    """
+    reader = imageio.get_reader(video_info, "ffmpeg")
+    try:
+        for idx, frame_rgb in enumerate(reader):
+            if n_frames > 0 and idx >= n_frames:
+                break
+            yield frame_rgb
+    finally:
+        reader.close()
+
+
+def stream_video_at(video_info, indices):
+    """Yield only the frames at `indices` (ascending), in that order."""
+    wanted = iter(indices)
+    nxt = next(wanted, None)
+    if nxt is None:
+        return
+    for idx, frame_rgb in enumerate(stream_video(video_info)):
+        if idx == nxt:
+            yield frame_rgb
+            nxt = next(wanted, None)
+            if nxt is None:
+                return
 
 
 def contiguous(obj):

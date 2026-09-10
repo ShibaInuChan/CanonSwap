@@ -11,6 +11,7 @@ import numpy as np
 import os
 import os.path as osp
 import time
+from itertools import islice
 from rich.progress import track, Progress
 
 from .config.argument_config import ArgumentConfig
@@ -21,7 +22,7 @@ from .utils.camera import get_rotation_matrix
 from .utils.video import images2video, concat_frames, get_fps, add_audio_to_video, has_audio_stream, to_frames, StreamingVideoWriter
 from .utils.crop import prepare_paste_back, paste_back
 from .utils.crop import dilation_mask, erode_mask, smooth_mask, blend_images, SoftErosion
-from .utils.io import load_image_rgb, load_video, resize_to_limit, dump, load
+from .utils.io import load_image_rgb, load_video, stream_video, stream_video_at, resize_to_limit, dump, load
 from .utils.helper import mkdir, basename, dct2device, is_video, is_template, remove_suffix, is_image, is_square_video, calc_motion_multiplier
 from .utils.filter import smooth
 from .utils.rprint import rlog as log
@@ -244,33 +245,44 @@ class CanSwapPipeline(object):
         timings['source id'] = time.perf_counter() - t0
 
         ######## process target info ########
+        # NOTE: for a video the frames are streamed, never collected into a list.
+        # Decoding a whole clip up front costs ~6MB per 1080p frame and ~25MB per
+        # 4K frame, so a few thousand frames is several GB of RAM before any work
+        # starts -- enough to take the machine down. The clip is decoded twice
+        # instead (cheap: a fraction of a second per pass), once to track/crop and
+        # once to paste back, holding only one batch of full-resolution frames.
         t0 = time.perf_counter()
         if is_video(args.driving):
             flag_is_driving_video = True
             output_fps = int(get_fps(args.driving))
             log(f"Load driving video from: {args.driving}, FPS is {output_fps}")
-            driving_rgb_lst = load_video(args.driving)
+            driving_frames = lambda: stream_video(args.driving)
         elif is_image(args.driving):
             flag_is_driving_video = False
             driving_img_rgb = load_image_rgb(args.driving)
             output_fps = 25
             log(f"Load driving image from {args.driving}")
-            driving_rgb_lst = [driving_img_rgb]
+            driving_frames = lambda: iter([driving_img_rgb])
         else:
             raise Exception(f"{args.driving} is not a supported type!")
         timings['load target'] = time.perf_counter() - t0
 
-        n_frames = len(driving_rgb_lst)
-
         ######## crop / track the target ########
         t0 = time.perf_counter()
         target_M_c2o_lst = None
+        kept_idx_lst = None
         if inf_cfg.flag_crop_driving_video or (not is_square_video(args.driving)):
-            ret_d = self.cropper.crop_source_video(driving_rgb_lst, crop_cfg)
-            log(f'Target video is cropped, {len(ret_d["frame_crop_lst"])} frames are processed.')
-            if len(ret_d["frame_crop_lst"]) is not n_frames and flag_is_driving_video:
-                n_frames = min(n_frames, len(ret_d["frame_crop_lst"]))
-            driving_rgb_crop_lst, driving_lmk_crop_lst, target_M_c2o_lst = ret_d['frame_crop_lst'], ret_d['lmk_crop_lst'], ret_d['M_c2o_lst']
+            ret_d = self.cropper.crop_source_video(driving_frames(), crop_cfg)
+            driving_rgb_crop_lst, driving_lmk_crop_lst = ret_d['frame_crop_lst'], ret_d['lmk_crop_lst']
+            target_M_c2o_lst = ret_d['M_c2o_lst']
+            n_frames = len(driving_rgb_crop_lst)
+            # Frames with no detected face are dropped by the cropper, so results
+            # are indexed by this list, not by source frame number. A cropper that
+            # does not report it is assumed to have kept every frame.
+            kept_idx_lst = ret_d.get('idx_lst')
+            if kept_idx_lst is None:
+                kept_idx_lst = list(range(n_frames))
+            log(f'Target video is cropped, {n_frames} frames are processed.')
             # NOTE: the cropper already returns 256x256 crops, so only resize when
             # something else produced them (the old unconditional resize copied
             # every frame for nothing).
@@ -279,10 +291,16 @@ class CanSwapPipeline(object):
             ]
             lmk_to_full_scale = crop_cfg.dsize / 256
         else:
+            driving_rgb_lst = list(driving_frames())
             driving_lmk_crop_lst = self.cropper.calc_lmks_from_cropped_video(driving_rgb_lst)
             driving_rgb_crop_256x256_lst = [cv2.resize(_, (256, 256)) for _ in driving_rgb_lst]  # force to resize to 256x256
+            n_frames = len(driving_rgb_crop_256x256_lst)
             lmk_to_full_scale = 1.0
+            del driving_rgb_lst
         timings['crop target'] = time.perf_counter() - t0
+
+        if n_frames == 0:
+            raise Exception(f'No face was detected in any frame of {args.driving}.')
 
         ######## what to produce ########
         flag_pasteback = bool(inf_cfg.flag_pasteback and inf_cfg.flag_do_crop)
@@ -316,9 +334,17 @@ class CanSwapPipeline(object):
             log(f"The output is an image.")
 
         ######## animate ########
+        # Only the frames that paste-back actually needs are decoded, one batch at
+        # a time; with paste-back off the video is not decoded a second time.
         t0 = time.perf_counter()
         t_net = 0.0
         i = 0
+        if not flag_pasteback:
+            full_frames = iter(())
+        elif flag_is_driving_video:
+            full_frames = stream_video_at(args.driving, kept_idx_lst)
+        else:
+            full_frames = iter((driving_img_rgb,))
         try:
             with Progress(transient=True) as progress:
                 task = progress.add_task('🚀Swapping...', total=n_frames)
@@ -348,11 +374,15 @@ class CanSwapPipeline(object):
                     t_net += time.perf_counter() - t_batch
 
                     if flag_pasteback:
+                        batch_full = list(islice(full_frames, b))
+                        if len(batch_full) != b:
+                            raise Exception(
+                                f'Target video ended early: expected {b} more frames at {i}, got {len(batch_full)}.')
                         soft_masks = self._build_soft_masks(
-                            driving_lmk_crop_lst[i:i + b], driving_rgb_lst[i].shape, device, lmk_to_full_scale
+                            driving_lmk_crop_lst[i:i + b], batch_full[0].shape, device, lmk_to_full_scale
                         )
                     else:
-                        soft_masks = [None] * b
+                        batch_full, soft_masks = None, [None] * b
 
                     for k in range(b):
                         idx = i + k
@@ -363,14 +393,14 @@ class CanSwapPipeline(object):
                             I_can_lst.append(can_imgs[k])
 
                         if flag_pasteback:
-                            frame = self._paste_back(I_p_i, target_M_c2o_lst[idx], driving_rgb_lst[idx], soft_masks[k])
+                            frame = self._paste_back(I_p_i, target_M_c2o_lst[idx], batch_full[k], soft_masks[k])
                             frame = add_image_watermark(frame, watermark_path, opacity=0.2, inplace=True)
+                            batch_full[k] = None  # let the frame be collected
                         else:
                             frame = add_image_watermark(I_p_i, watermark_path, opacity=0.2)
 
                         if writer is not None:
                             writer.append(frame)
-                            driving_rgb_lst[idx] = None  # let the frame be collected
                         else:
                             result_frames.append(frame)
 

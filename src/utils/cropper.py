@@ -36,6 +36,8 @@ class Trajectory:
     M_c2o_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # M_c2o list
     M_o2c_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # M_o2c list
 
+    idx_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # source frame index of each result
+
     frame_rgb_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # frame list
     lmk_crop_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # lmk list
     frame_rgb_crop_lst: Union[Tuple, List, np.ndarray] = field(default_factory=list)  # frame crop list
@@ -218,12 +220,18 @@ class Cropper(object):
             trajectory.lmk_crop_lst.append(ret_dct["lmk_crop_256x256"])
             trajectory.M_c2o_lst.append(ret_dct['M_c2o'])
             trajectory.M_o2c_lst.append(ret_dct['M_o2c'])
+            # NOTE: frames where no face was found are skipped above, so the
+            # results are not necessarily aligned with the input frames. Record
+            # which source frame each result came from, otherwise the caller
+            # pastes result i back onto the wrong frame.
+            trajectory.idx_lst.append(idx)
 
         return {
             "frame_crop_lst": trajectory.frame_rgb_crop_lst,
             "lmk_crop_lst": trajectory.lmk_crop_lst,
             "M_c2o_lst": trajectory.M_c2o_lst,
-            "M_o2c_lst": trajectory.M_o2c_lst
+            "M_o2c_lst": trajectory.M_o2c_lst,
+            "idx_lst": trajectory.idx_lst,
         }
 
 
