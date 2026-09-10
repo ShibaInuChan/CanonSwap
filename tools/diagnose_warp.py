@@ -25,6 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.modules.dense_motion import DenseMotionNetwork
+from src.modules.fast_conv3d import conv3d_via_conv2d, conv3d_via_conv2d_fused
 from src.modules.util import kp2gaussian, make_coordinate_grid
 
 NUM_KP, COMPRESS, D, H, W = 21, 4, 16, 64, 64
@@ -194,18 +195,25 @@ def report_suspects(device):
         except Exception as e:
             print('   fp16 weights failed:', str(e).splitlines()[0])
 
-        # candidate fix: the same convolution expressed as 7 stacked 2D convolutions
+        # the two rewrites: one 2D convolution per depth tap, or all taps stacked
+        # into a single 2D convolution
         small = torch.randn(1, 5, 6, 12, 12, device=device)
         w_small = torch.randn(4, 5, 7, 7, 7, device=device) * 0.02
         b_small = torch.randn(4, device=device)
         ref = F.conv3d(small, w_small, b_small, padding=3)
-        alt = conv3d_as_conv2d(small, w_small, b_small)
-        print(f'   [decomposition matches F.conv3d: {torch.allclose(ref, alt, atol=1e-4)}, '
-              f'max diff {(ref - alt).abs().max():.2e}]')
+        for label, alt in (('per-tap', conv3d_via_conv2d(small, w_small, b_small)),
+                           ('fused', conv3d_via_conv2d_fused(small, w_small, b_small))):
+            print(f'   [{label} matches F.conv3d: {torch.allclose(ref, alt, atol=1e-4)}, '
+                  f'max diff {(ref - alt).abs().max():.2e}]')
         rows.append(('mask conv as 7x conv2d, fp32',
-                     timeit(lambda: conv3d_as_conv2d(x, conv.weight, conv.bias), device)))
+                     timeit(lambda: conv3d_via_conv2d(x, conv.weight, conv.bias), device)))
         rows.append(('mask conv as 7x conv2d, fp16 autocast',
                      timeit(lambda: _autocast_decomp(conv, x, device), device)))
+        w_cat = conv.weight.permute(2, 0, 1, 3, 4).reshape(-1, conv.weight.shape[1], 7, 7).contiguous()
+        rows.append(('mask conv as 1 fused conv2d, fp32',
+                     timeit(lambda: conv3d_via_conv2d_fused(x, conv.weight, conv.bias, w_cat), device)))
+        rows.append(('mask conv as 1 fused conv2d, fp16 autocast',
+                     timeit(lambda: _autocast_decomp(conv, x, device, fused=True), device)))
 
         n = NUM_KP + 1
         feat = torch.randn(n, COMPRESS, D, H, W, device=device)
@@ -221,39 +229,6 @@ def report_suspects(device):
         print(f'   {name:<32}{ms:>9.1f} ms')
     print('\n   (each of these runs twice per frame)')
 
-
-
-def conv3d_as_conv2d(x, weight, bias):
-    """Exactly equivalent to F.conv3d(x, weight, bias, padding=k//2), computed as
-    kd separate 2D convolutions summed over depth-shifted slices.
-
-    Same arithmetic, but 2D convolution kernels are usually far better optimised
-    than 3D ones, so this can be much faster for a big kernel like the 7x7x7
-    mask convolution.
-    """
-    B, C, Dd, Hh, Ww = x.shape
-    O, _, kd, kh, kw = weight.shape
-    pd = kd // 2
-    xf = x.permute(0, 2, 1, 3, 4).reshape(B * Dd, C, Hh, Ww)
-    out = None
-    for i in range(kd):
-        y = F.conv2d(xf, weight[:, :, i], bias=None, padding=(kh // 2, kw // 2))
-        y = y.view(B, Dd, O, Hh, Ww)
-        if out is None:
-            out = torch.zeros(B, Dd, O, Hh, Ww, device=y.device, dtype=y.dtype)
-        shift = i - pd
-        lo, hi = max(0, -shift), min(Dd, Dd - shift)
-        if lo < hi:
-            out[:, lo:hi] += y[:, lo + shift:hi + shift]
-    out = out.permute(0, 2, 1, 3, 4)
-    if bias is not None:
-        out = out + bias.view(1, -1, 1, 1, 1)
-    return out
-
-
-def _autocast_decomp(conv, x, device):
-    with torch.no_grad(), autocast_ctx(device):
-        return conv3d_as_conv2d(x, conv.weight, conv.bias)
 
 
 def _autocast_call(conv, x, device):

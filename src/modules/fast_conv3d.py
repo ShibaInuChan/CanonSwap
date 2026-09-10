@@ -54,34 +54,66 @@ def macs(conv: nn.Conv3d, shape) -> float:
     return conv.in_channels * conv.out_channels * k[0] * k[1] * k[2] * d * h * w
 
 
-def conv3d_via_conv2d(x, weight, bias):
-    """Same result as F.conv3d(x, weight, bias, padding=k//2), via 2D convolutions.
+def _depth_shifted_sum(y_per_tap, b, d, out_c, h, w, kd):
+    """Sum the per-tap 2D results over depth-shifted slices, accumulating in fp32.
 
-    The per-tap results are accumulated in fp32 even when the convolutions run in
-    fp16, so this does not lose precision against conv3d's internal accumulation.
+    y_per_tap(i) returns the i-th tap's result shaped (b, d, out_c, h, w).
+    fp32 accumulation matches conv3d's own internal accumulation, so running the
+    convolutions in fp16 does not cost precision here.
     """
-    b, _, d, h, w = x.shape
-    out_c, _, kd, kh, kw = weight.shape
     pd = kd // 2
-
-    xf = x.permute(0, 2, 1, 3, 4).reshape(b * d, x.shape[1], h, w)
-    out, out_dtype = None, None
+    out = None
+    out_dtype = None
     for i in range(kd):
-        y = F.conv2d(xf, weight[:, :, i], bias=None, padding=(kh // 2, kw // 2))
-        y = y.view(b, d, out_c, h, w)
+        y = y_per_tap(i)
         if out is None:
             # NOTE: the result dtype has to be the one conv2d produced, not x's.
             # Under autocast a convolution takes fp32 in and gives fp16 out, so
-            # returning x's dtype here would hand the rest of the network a
-            # different precision than the native conv3d would have.
+            # returning x's dtype would hand the rest of the network a different
+            # precision than the native conv3d would have.
             out_dtype = y.dtype
             out = torch.zeros(b, d, out_c, h, w, device=y.device, dtype=torch.float32)
         shift = i - pd
         lo, hi = max(0, -shift), min(d, d - shift)
         if lo < hi:
             out[:, lo:hi] += y[:, lo + shift:hi + shift].float()
+    return out.permute(0, 2, 1, 3, 4).to(out_dtype), out_dtype
 
-    out = out.permute(0, 2, 1, 3, 4).to(out_dtype)
+
+def conv3d_via_conv2d(x, weight, bias):
+    """Same result as F.conv3d(x, weight, bias, padding=k//2), as kd 2D convolutions."""
+    b, _, d, h, w = x.shape
+    out_c, _, kd, kh, kw = weight.shape
+    xf = x.permute(0, 2, 1, 3, 4).reshape(b * d, x.shape[1], h, w)
+
+    def tap(i):
+        y = F.conv2d(xf, weight[:, :, i], bias=None, padding=(kh // 2, kw // 2))
+        return y.view(b, d, out_c, h, w)
+
+    out, out_dtype = _depth_shifted_sum(tap, b, d, out_c, h, w, kd)
+    if bias is not None:
+        out = out + bias.view(1, -1, 1, 1, 1).to(out_dtype)
+    return out
+
+
+def conv3d_via_conv2d_fused(x, weight, bias, w_cat=None):
+    """Same again, but as a SINGLE 2D convolution.
+
+    The kd taps are stacked along the output-channel axis of the weight, so one
+    conv2d produces all of them at once. This matters when the layer has few
+    output channels -- the dense-motion mask convolution has 22, which makes each
+    per-tap convolution a badly shaped GEMM; stacking gives it kd*22 instead, at
+    identical arithmetic and without duplicating the input.
+    """
+    b, _, d, h, w = x.shape
+    out_c, _, kd, kh, kw = weight.shape
+    xf = x.permute(0, 2, 1, 3, 4).reshape(b * d, x.shape[1], h, w)
+    if w_cat is None:
+        w_cat = weight.permute(2, 0, 1, 3, 4).reshape(kd * out_c, weight.shape[1], kh, kw)
+    y = F.conv2d(xf, w_cat, bias=None, padding=(kh // 2, kw // 2))
+    y = y.view(b, d, kd, out_c, h, w)
+
+    out, out_dtype = _depth_shifted_sum(lambda i: y[:, :, i], b, d, out_c, h, w, kd)
     if bias is not None:
         out = out + bias.view(1, -1, 1, 1, 1).to(out_dtype)
     return out
@@ -94,8 +126,11 @@ def _sync(device):
         torch.mps.synchronize()
 
 
+NATIVE, PER_TAP, FUSED = 'native', 'per-tap', 'fused'
+
+
 class FastConv3d(nn.Module):
-    """Wraps an nn.Conv3d and uses whichever of the two paths is faster.
+    """Wraps an nn.Conv3d and uses whichever equivalent path is fastest here.
 
     The wrapped convolution keeps its own parameters, so this must be applied
     after the checkpoint is loaded (the wrapper adds a 'conv.' prefix to the
@@ -106,55 +141,68 @@ class FastConv3d(nn.Module):
         super().__init__()
         self.conv = conv
         self.mode = mode
-        self._decomposed_for = {}
+        self._path_for = {}
+        self._w_cat = None
+        self._w_cat_version = None
 
-    def _use_decomposed(self, x):
-        if self.mode == 'native':
-            return False
-        if not is_eligible(self.conv):
-            return False
-        if self.mode == 'decomposed':
-            return True
+    def w_cat(self):
+        """Taps stacked along the output-channel axis; the weights never change
+        during inference, so this is built once."""
+        w = self.conv.weight
+        if self._w_cat is None or self._w_cat_version != w._version:
+            out_c, in_c, kd, kh, kw = w.shape
+            self._w_cat = w.permute(2, 0, 1, 3, 4).reshape(kd * out_c, in_c, kh, kw).contiguous()
+            self._w_cat_version = w._version
+        return self._w_cat
+
+    def _path(self, x):
+        if self.mode == NATIVE or not is_eligible(self.conv):
+            return NATIVE
+        if self.mode in (PER_TAP, FUSED):
+            return self.mode
 
         key = (tuple(x.shape), x.dtype)
-        cached = self._decomposed_for.get(key)
+        cached = self._path_for.get(key)
         if cached is not None:
             return cached
 
         if macs(self.conv, x.shape) < MIN_MACS:
-            self._decomposed_for[key] = False
-            return False
+            self._path_for[key] = NATIVE
+            return NATIVE
 
         chosen = self._measure(x)
-        self._decomposed_for[key] = chosen
+        self._path_for[key] = chosen
         return chosen
 
     def _measure(self, x):
         w, b = self.conv.weight, self.conv.bias
-
-        def native():
-            return self.conv(x)
-
-        def decomposed():
-            return conv3d_via_conv2d(x, w, b)
-
-        try:
-            timings = []
-            for fn in (native, decomposed):
-                fn()  # warm up
+        candidates = [
+            (NATIVE, lambda: self.conv(x)),
+            (PER_TAP, lambda: conv3d_via_conv2d(x, w, b)),
+            (FUSED, lambda: conv3d_via_conv2d_fused(x, w, b, self.w_cat())),
+        ]
+        best, best_t = NATIVE, None
+        for name, fn in candidates:
+            try:
+                fn()  # warm up (also builds any cached weight)
                 _sync(x.device)
                 t0 = time.perf_counter()
                 for _ in range(2):
                     fn()
                 _sync(x.device)
-                timings.append(time.perf_counter() - t0)
-            return timings[1] < timings[0]
-        except Exception:
-            return False
+                elapsed = time.perf_counter() - t0
+            except Exception:
+                continue  # e.g. out of memory for this path; just do not pick it
+            if best_t is None or elapsed < best_t:
+                best, best_t = name, elapsed
+        return best
 
     def forward(self, x):
-        if self._use_decomposed(x):
+        path = self._path(x)
+        if path == PER_TAP:
             return conv3d_via_conv2d(x, self.conv.weight, self.conv.bias)
+        if path == FUSED:
+            return conv3d_via_conv2d_fused(x, self.conv.weight, self.conv.bias, self.w_cat())
         return self.conv(x)
 
 
@@ -162,14 +210,14 @@ def convert_conv3d(module: nn.Module, mode=None) -> int:
     """Replace every nn.Conv3d under `module` with a FastConv3d, in place.
 
     Call this AFTER loading weights. Returns the number of layers wrapped.
-    `mode` is 'auto' (measure per layer and shape), 'native' or 'decomposed';
-    it defaults to $CANONSWAP_CONV3D or 'auto'.
+    `mode` is 'auto' (measure per layer and shape), or one of 'native',
+    'per-tap', 'fused' to force a path. Defaults to $CANONSWAP_CONV3D or 'auto'.
     """
     if mode is None:
         mode = os.environ.get('CANONSWAP_CONV3D', 'auto').lower()
-    if mode not in ('auto', 'native', 'decomposed'):
+    if mode not in ('auto', NATIVE, PER_TAP, FUSED):
         mode = 'auto'
-    if mode == 'native':
+    if mode == NATIVE:
         return 0
 
     n = 0
