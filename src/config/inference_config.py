@@ -57,6 +57,7 @@ class InferenceConfig(PrintableConfig):
     ########## performance ##########
     batch_size: int = 4 # number of frames pushed through the network at once; higher is faster but uses more VRAM (it is halved automatically on out-of-memory)
     flag_write_concat_video: bool = False # write the side-by-side comparison video; it costs an extra generator pass per frame plus a second encode
+    flag_fast_conv3d: bool = True # let each 3D convolution pick between the native call and an equivalent stack of 2D convolutions, whichever is faster on this device
 
     # NOT EXPORTED PARAMS
     lip_normalize_threshold: float = 0.03 # threshold for flag_normalize_lip

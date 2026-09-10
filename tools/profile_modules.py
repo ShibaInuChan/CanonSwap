@@ -28,6 +28,7 @@ from src.modules.motion_extractor import MotionExtractor
 from src.modules.spade_generator import SPADEDecoder
 from src.modules.warping_network import WarpingNetwork
 from src.can_swap_e2e import can_swapper
+from src.modules.fast_conv3d import convert_conv3d
 from src.utils.camera import headpose_pred_to_degree
 
 MODELS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'config', 'models.yaml')
@@ -87,6 +88,12 @@ def build(device, half):
         print(f'loaded weights from {WEIGHTS}')
     else:
         print(f'{WEIGHTS} not found, using random weights (timings are unaffected)')
+
+    if os.environ.get('CANONSWAP_CONV3D', 'auto').lower() != 'native':
+        n = sum(convert_conv3d(m) for m in (s.appearance_feature_extractor, s.motion_extractor,
+                                            s.warping_module, s.spade_generator,
+                                            s.swap_module, s.refine_module))
+        print(f'auto-tuning {n} 3D convolutions (CANONSWAP_CONV3D=native to compare without)')
     return s
 
 

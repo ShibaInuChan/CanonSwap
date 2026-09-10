@@ -84,13 +84,29 @@ model itself is unchanged — these are all scheduling/precision/IO changes:
   is constant for a whole video, so the 512×512×3×3 modulated kernel used by
   each of the swap module's 14 modulated convolutions is computed once instead
   of once per frame, and a plain convolution replaces the grouped one.
+- **3D convolutions pick the faster of two mathematically identical paths.**
+  Profiling on an M-series Mac showed the 7x7x7 mask convolution inside
+  `DenseMotionNetwork` — which the authors marked `# 65G! NOTE: computation
+  cost is large`, and which runs twice per frame — taking 431 ms of the
+  628 ms that stage costs, i.e. 45% of the entire frame. MPS' `conv3d` is
+  simply slow: expressing the same convolution as seven 2D convolutions
+  summed over depth-shifted slices measured 189 ms, faster in fp32 than the
+  native call is in fp16. Each 3D convolution now times both paths once for
+  its input shape and keeps the winner, so CUDA (where cuDNN's conv3d is
+  well tuned) is unaffected. `CANONSWAP_CONV3D=native` disables it.
 - Smaller things: no more per-frame debug image writes, no per-frame re-decode of
   the watermark PNG, no device→host synchronisation inside the mask erosion, only
   the two face models that are actually used are loaded, and OpenCV is no longer
   pinned to a single thread (set `CANONSWAP_CV_THREADS=1` to restore that).
 
 A per-stage timing summary is printed at the end of each run, so it is easy to
-see where the remaining time goes.
+see where the remaining time goes. Two tools help dig further:
+
+```bash
+python tools/profile_modules.py --batch 1,2,4   # per-network-stage timings, best batch size
+python tools/diagnose_warp.py                   # why the warp stages cost what they cost:
+                                                # autocast coverage, CPU fallbacks, per-step breakdown
+```
 
 Note that this model is still significantly heavier per frame than lightweight
 one-shot swappers (e.g. inswapper_128), and Apple Silicon remains slower than a

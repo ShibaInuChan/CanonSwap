@@ -23,6 +23,7 @@ from src.modules.appearance_feature_extractor import AppearanceFeatureExtractor
 from src.modules.adaptive_modulate import transfer_model
 from src.modules.adaptive_modulate import transfer_model2 as transfer_model_big
 from src.modules.adaptive_modulate import G3d
+from src.modules.fast_conv3d import convert_conv3d
 
 from .utils.timer import Timer
 from .utils.helper import load_model, concat_feat
@@ -69,6 +70,20 @@ class can_swapper(object):
         # self.swap_module = transfer_model().to(self.device).eval()
         # self.load_init_models()
         self.load_cpk()
+
+        # NOTE: after load_cpk(), because wrapping renames the parameters.
+        # MPS' conv3d is slow enough that expressing a 3D convolution as a stack
+        # of 2D ones more than doubles the speed of the dense-motion mask layer;
+        # each layer measures both once and keeps the winner, so this is a no-op
+        # on backends where the native call is already the faster one.
+        if getattr(inference_cfg, 'flag_fast_conv3d', True):
+            n_wrapped = 0
+            for m in (self.appearance_feature_extractor, self.motion_extractor,
+                      self.warping_module, self.spade_generator,
+                      self.swap_module, self.refine_module):
+                n_wrapped += convert_conv3d(m)
+            if n_wrapped:
+                log(f'Auto-tuning {n_wrapped} 3D convolutions (set CANONSWAP_CONV3D=native to disable).')
 
         # Optimize for inference
         if self.compile:

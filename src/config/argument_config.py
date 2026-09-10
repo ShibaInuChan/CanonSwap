@@ -39,6 +39,7 @@ class ArgumentConfig(PrintableConfig):
     ########## performance arguments ##########
     batch_size: Annotated[int, tyro.conf.arg(aliases=["-b"])] = 4  # number of frames processed by the network at once; larger is faster but needs more VRAM/unified memory. It is halved automatically if the device runs out of memory
     flag_write_concat_video: bool = False  # also write the <source>--<target>_concat.mp4 side-by-side comparison video. It needs an extra generator pass per frame plus a second video encode, so it is off by default
+    flag_fast_conv3d: bool = True  # let each 3D convolution choose between the native call and an exactly equivalent stack of 2D convolutions, whichever is faster on this device (large win on Apple Silicon). CANONSWAP_CONV3D=native also disables it
     ########## source crop arguments ##########
     det_thresh: float = 0.15 # detection threshold
     scale: float = 2.3  # the ratio of face area is smaller if scale is larger
