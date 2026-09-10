@@ -236,6 +236,12 @@ def _autocast_call(conv, x, device):
         return conv(x)
 
 
+def _autocast_decomp(conv, x, device, fused=False):
+    fn = conv3d_via_conv2d_fused if fused else conv3d_via_conv2d
+    with torch.no_grad(), autocast_ctx(device):
+        return fn(x, conv.weight, conv.bias)
+
+
 def main():
     device = pick_device()
     print(f'device: {device}   torch {torch.__version__}')
