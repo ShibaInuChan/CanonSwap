@@ -19,7 +19,7 @@ from .config.inference_config import InferenceConfig
 from .config.crop_config import CropConfig
 from .utils.cropper import Cropper
 from .utils.camera import get_rotation_matrix
-from .utils.video import images2video, concat_frames, get_fps, add_audio_to_video, has_audio_stream, to_frames, StreamingVideoWriter
+from .utils.video import images2video, concat_frames, get_fps, get_frame_count, add_audio_to_video, has_audio_stream, to_frames, StreamingVideoWriter
 from .utils.crop import prepare_paste_back, paste_back
 from .utils.crop import dilation_mask, erode_mask, smooth_mask, blend_images, SoftErosion
 from .utils.io import load_image_rgb, load_video, stream_video, stream_video_at, resize_to_limit, dump, load
@@ -256,12 +256,22 @@ class CanSwapPipeline(object):
             flag_is_driving_video = True
             output_fps = int(get_fps(args.driving))
             log(f"Load driving video from: {args.driving}, FPS is {output_fps}")
-            driving_frames = lambda: stream_video(args.driving)
+            n_frames_hint = get_frame_count(args.driving)
+
+            def driving_frames():
+                # Tracking every frame takes a while on a long clip and used to
+                # run silently; show what it is getting through.
+                with Progress(transient=True) as progress:
+                    task = progress.add_task('🚀Tracking faces...', total=n_frames_hint or None)
+                    for frame in stream_video(args.driving):
+                        yield frame
+                        progress.update(task, advance=1)
         elif is_image(args.driving):
             flag_is_driving_video = False
             driving_img_rgb = load_image_rgb(args.driving)
             output_fps = 25
             log(f"Load driving image from {args.driving}")
+            n_frames_hint = 1
             driving_frames = lambda: iter([driving_img_rgb])
         else:
             raise Exception(f"{args.driving} is not a supported type!")

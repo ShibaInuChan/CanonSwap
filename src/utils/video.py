@@ -202,6 +202,20 @@ def change_video_fps(input_file, output_file, fps=20, codec='libx264', crf=12):
     exec_cmd(cmd)
 
 
+def get_frame_count(filepath):
+    """Frame count from the container metadata, or 0 if it is not available.
+
+    Only used to give a progress bar a total, so an approximate answer is fine.
+    """
+    try:
+        cap = cv2.VideoCapture(filepath)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return max(0, n)
+    except Exception:
+        return 0
+
+
 def get_fps(filepath, default_fps=25):
     try:
         fps = cv2.VideoCapture(filepath).get(cv2.CAP_PROP_FPS)
