@@ -55,7 +55,10 @@ def main():
     torch.cuda.manual_seed_all(1)
     inference_cfg.flag_stitching = False
     inference_cfg.flag_pasteback = True
-    inference_cfg.flag_use_half_precision = False
+    # NOTE: half precision used to be forced off here, which meant the network
+    # always ran in fp32 even though --flag_use_half_precision defaults to True.
+    # It now follows the command line; pass `--flag_use_half_precision False` if
+    # the output shows black boxes on an fp16-incompatible GPU.
 
     canswap_pipeline = CanSwapPipeline(
             inference_cfg=inference_cfg,

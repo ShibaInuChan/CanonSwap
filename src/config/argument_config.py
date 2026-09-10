@@ -35,6 +35,10 @@ class ArgumentConfig(PrintableConfig):
     driving_smooth_observation_variance: float = 3e-7  # smooth strength scalar for the animated video when the input is a source video, the larger the number, the smoother the animated video; too much smoothness would result in loss of motion accuracy
     audio_priority: Literal['source', 'driving'] = 'driving'  # whether to use the audio from source or driving video
     animation_region: Literal["exp", "pose", "lip", "eyes", "all"] = "all" # the region where the animation was performed, "exp" means the expression, "pose" means the head pose, "all" means all regions
+
+    ########## performance arguments ##########
+    batch_size: Annotated[int, tyro.conf.arg(aliases=["-b"])] = 4  # number of frames processed by the network at once; larger is faster but needs more VRAM/unified memory. It is halved automatically if the device runs out of memory
+    flag_write_concat_video: bool = False  # also write the <source>--<target>_concat.mp4 side-by-side comparison video. It needs an extra generator pass per frame plus a second video encode, so it is off by default
     ########## source crop arguments ##########
     det_thresh: float = 0.15 # detection threshold
     scale: float = 2.3  # the ratio of face area is smaller if scale is larger

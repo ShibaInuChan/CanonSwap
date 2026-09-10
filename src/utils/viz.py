@@ -1,6 +1,7 @@
 # coding: utf-8
 
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
+import cv2
+from .cv2_config import configure_opencv; configure_opencv()
 
 
 def viz_lmk(img_, vps, **kwargs):

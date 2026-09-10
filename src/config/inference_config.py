@@ -54,6 +54,10 @@ class InferenceConfig(PrintableConfig):
     source_division: int = 2 # make sure the height and width of source image or video can be divided by this number
     animation_region: Literal["exp", "pose", "lip", "eyes", "all"] = "all" # the region where the animation was performed, "exp" means the expression, "pose" means the head pose
 
+    ########## performance ##########
+    batch_size: int = 4 # number of frames pushed through the network at once; higher is faster but uses more VRAM (it is halved automatically on out-of-memory)
+    flag_write_concat_video: bool = False # write the side-by-side comparison video; it costs an extra generator pass per frame plus a second encode
+
     # NOT EXPORTED PARAMS
     lip_normalize_threshold: float = 0.03 # threshold for flag_normalize_lip
     source_video_eye_retargeting_threshold: float = 0.18 # threshold for eyes retargeting if the input is a source video

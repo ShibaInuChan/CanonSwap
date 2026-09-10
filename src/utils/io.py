@@ -4,7 +4,8 @@ import os.path as osp
 import imageio
 import numpy as np
 import pickle
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
+import cv2
+from .cv2_config import configure_opencv; configure_opencv()
 
 from .helper import mkdir, suffix
 

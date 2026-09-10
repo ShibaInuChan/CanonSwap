@@ -54,7 +54,47 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python inference_canswap.py -s examples/source.jpe
 - Wrapped the inference call in `torch.no_grad()` (`inference_canswap.py`) — several forward passes in the per-frame loop weren't already covered by an inner `no_grad()`, causing memory to grow unboundedly over the course of a video.
 - Removed a redundant generator pass that only fed the debug `_concat.mp4` comparison video, for a modest speed-up.
 
-**Performance:** even with these fixes, this model is significantly heavier per-frame than lightweight one-shot swappers (e.g. inswapper_128). Expect notably longer processing time on Apple Silicon than on a comparable CUDA GPU. Test on a short clip before processing a full video.
+## Performance
+
+The face-swap pipeline (`inference_canswap.py`) has been reworked for speed. The
+model itself is unchanged — these are all scheduling/precision/IO changes:
+
+- **Half precision (fp16) is now actually used.** `inference_canswap.py` used to
+  force it off, and autocast was skipped entirely on MPS, so every run was fp32.
+  fp16 autocast is now probed once at start-up (CUDA *and* MPS) and used when it
+  works, falling back to fp32 automatically. Pass
+  `--flag_use_half_precision False` to force fp32.
+- **Frames are processed in batches** (`--batch_size`, default 4) instead of one
+  at a time, so the GPU is no longer stalled by per-frame launch overhead. The
+  batch size is halved automatically if the device runs out of memory.
+- **Motion extraction is fused into the swap loop.** It used to be a separate
+  full pass over the video with a device→numpy→device round trip per frame.
+- **The comparison video is opt-in** (`--flag_write_concat_video`). Producing it
+  costs an extra full generator pass per frame plus a second video encode.
+- **Paste-back only touches the face region.** The soft mask (a 21×21
+  convolution applied three times) and the blend used to run over the entire
+  frame; they now run over the mask's bounding box, which is a ~10× reduction at
+  1080p and more at 4K. The result is identical: the mask is zero everywhere
+  outside that box.
+- **Full-resolution frames are no longer accumulated in RAM.** Results are
+  encoded as they are produced instead of being buffered twice (once raw, once
+  watermarked) — several GB saved on a 1080p clip, which on a unified-memory Mac
+  is the difference between running and swapping.
+- **The identity-modulated convolution weights are cached.** The source identity
+  is constant for a whole video, so the 512×512×3×3 modulated kernel used by
+  each of the swap module's 14 modulated convolutions is computed once instead
+  of once per frame, and a plain convolution replaces the grouped one.
+- Smaller things: no more per-frame debug image writes, no per-frame re-decode of
+  the watermark PNG, no device→host synchronisation inside the mask erosion, only
+  the two face models that are actually used are loaded, and OpenCV is no longer
+  pinned to a single thread (set `CANONSWAP_CV_THREADS=1` to restore that).
+
+A per-stage timing summary is printed at the end of each run, so it is easy to
+see where the remaining time goes.
+
+Note that this model is still significantly heavier per frame than lightweight
+one-shot swappers (e.g. inswapper_128), and Apple Silicon remains slower than a
+comparable CUDA GPU. Test on a short clip before processing a full video.
 
 ## Model Download
 
@@ -112,6 +152,19 @@ The first inference run will automatically download the face parsing model.
 python inference_canswap.py -s examples/source.jpeg -t examples/target.mp4
 ```
 This also supports image-to-image swapping.
+
+Useful performance options:
+
+```bash
+# larger batches are faster but need more VRAM / unified memory (default: 4)
+python inference_canswap.py -s examples/source.jpeg -t examples/target.mp4 -b 8
+
+# fall back to fp32 if fp16 produces artefacts on your GPU
+python inference_canswap.py -s ... -t ... --flag_use_half_precision False
+
+# also write the side-by-side comparison video (slower: one extra generator pass per frame)
+python inference_canswap.py -s ... -t ... --flag_write_concat_video True
+```
 
 ### Video-to-Image Swap
 ```bash

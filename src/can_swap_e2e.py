@@ -84,6 +84,18 @@ class can_swapper(object):
         self.netArc.to(self.device)
         self.netArc.eval()
 
+        # TF32 is a free ~2x on the matmul/conv heavy parts of Ampere+ GPUs and
+        # is ignored elsewhere.
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
+        self.autocast_available = self._probe_autocast()
+        if self.inference_cfg.flag_use_half_precision and self.autocast_available:
+            log('Half precision (fp16) inference enabled.')
+
     def load_cpk(self):
         combined_weights_path = "pretrained_weights/combined_weights.pth"
 
@@ -110,13 +122,36 @@ class can_swapper(object):
         swap_feature = self.swap_module(feature_3d, source_id)
         return swap_feature
 
+    def _probe_autocast(self):
+        """Check once whether fp16 autocast actually works on this device.
+
+        Autocast used to be skipped entirely on MPS, which meant Apple Silicon
+        always ran the whole network in fp32.  Recent PyTorch versions do
+        support `torch.autocast("mps", torch.float16)`, so probe it once with a
+        real convolution and fall back to fp32 if anything raises.
+        """
+        device_type = 'cuda' if self.device.startswith('cuda') else self.device
+        if device_type not in ('cuda', 'mps'):
+            return False
+        try:
+            with torch.no_grad(), torch.autocast(device_type=device_type, dtype=torch.float16):
+                x = torch.zeros(1, 1, 8, 8, device=self.device)
+                w = torch.zeros(1, 1, 3, 3, device=self.device)
+                y = torch.nn.functional.conv2d(x, w, padding=1)
+            _ = float(y.sum())
+            return True
+        except Exception as e:
+            log(f'fp16 autocast unavailable on {device_type} ({e}); running in fp32.')
+            return False
+
     def inference_ctx(self):
-        if self.device == "mps":
-            ctx = contextlib.nullcontext()
-        else:
-            ctx = torch.autocast(device_type=self.device[:4], dtype=torch.float16,
-                                 enabled=self.inference_cfg.flag_use_half_precision)
-        return ctx
+        if not self.inference_cfg.flag_use_half_precision or not self.autocast_available:
+            return contextlib.nullcontext()
+        device_type = 'cuda' if self.device.startswith('cuda') else self.device
+        return torch.autocast(device_type=device_type, dtype=torch.float16, enabled=True)
+
+    def half_precision_enabled(self):
+        return bool(self.inference_cfg.flag_use_half_precision and self.autocast_available)
 
     def update_config(self, user_args):
         for k, v in user_args.items():
@@ -181,7 +216,7 @@ class can_swapper(object):
         with torch.no_grad(), self.inference_ctx():
             kp_info = self.motion_extractor(x)
 
-            if self.inference_cfg.flag_use_half_precision:
+            if self.half_precision_enabled():
                 # float the dict
                 for k, v in kp_info.items():
                     if isinstance(v, torch.Tensor):
@@ -300,7 +335,7 @@ class can_swapper(object):
             ret_dct['out'] = self.spade_generator(feature=ret_dct['out'])
 
             # float the dict
-            if self.inference_cfg.flag_use_half_precision:
+            if self.half_precision_enabled():
                 for k, v in ret_dct.items():
                     if isinstance(v, torch.Tensor):
                         ret_dct[k] = v.float()
@@ -313,13 +348,83 @@ class can_swapper(object):
 
     def parse_output(self, out: torch.Tensor) -> np.ndarray:
         """ construct the output as standard
-        return: 1xHxWx3, uint8
-        """
-        out = np.transpose(out.data.cpu().numpy(), [0, 2, 3, 1])  # 1x3xHxW -> 1xHxWx3
-        out = np.clip(out, 0, 1)  # clip to 0~1
-        out = np.clip(out * 255, 0, 255).astype(np.uint8)  # 0~1 -> 0~255
+        return: BxHxWx3, uint8
 
-        return out
+        NOTE: the conversion to uint8 is done on the device before the copy to
+        host memory, so only a quarter of the bytes cross the bus (a 512x512
+        frame goes from 3MB of float32 to 768KB) and numpy no longer has to
+        transpose/clip/scale a float array per frame.
+        """
+        with torch.no_grad():
+            # NOTE: clamp() (not clamp_) so the caller's tensor is never modified
+            # in place; the scaling then runs on that fresh copy.
+            out = out.detach().float().clamp(0, 1).mul_(255)
+            out = out.permute(0, 2, 3, 1).to(torch.uint8).contiguous()  # BxCxHxW -> BxHxWx3
+            return out.cpu().numpy()
+
+    def prepare_frames(self, imgs) -> torch.Tensor:
+        """Turn a list/array of HxWx3 uint8 frames into a Bx3xHxW float tensor.
+
+        Used to feed the network one batch at a time; `prepare_videos` converts
+        (and uploads) the *whole* video at once, which for a long clip means
+        hundreds of MB of float32 sitting on the device for the entire run.
+        """
+        if isinstance(imgs, np.ndarray):
+            arr = imgs
+        else:
+            arr = np.stack(imgs, axis=0)
+        if arr.ndim == 3:
+            arr = arr[np.newaxis]
+
+        x = torch.from_numpy(np.ascontiguousarray(arr))
+        x = x.to(self.device, non_blocking=True)
+        x = x.permute(0, 3, 1, 2).float().div_(255.).clamp_(0, 1)  # BxHxWx3 -> Bx3xHxW
+        return x
+
+    def swap_batch(self, I_d, source_id, need_canonical=False):
+        """Run the full swap for a batch of driving frames.
+
+        Everything that used to be spread over the per-frame loop (motion
+        extraction, appearance feature, canonical warp, identity swap, refine,
+        warp + decode) happens here inside a single no_grad/autocast region, so
+        the batch dimension is actually used and the fp16 context also covers
+        the swap/refine modules, which previously ran in fp32 no matter what.
+
+        I_d: Bx3x256x256, normalized to 0~1
+        source_id: 1xD (shared by the whole batch) or BxD
+        return: (out BxHxWx3 uint8, canonical BxHxWx3 uint8 or None)
+        """
+        with torch.no_grad(), self.inference_ctx():
+            x_info = self.motion_extractor(I_d)
+            if self.half_precision_enabled():
+                x_info = {k: (v.float() if isinstance(v, torch.Tensor) else v) for k, v in x_info.items()}
+
+            bs = x_info['kp'].shape[0]
+            x_info['pitch'] = headpose_pred_to_degree(x_info['pitch'])[:, None]
+            x_info['yaw'] = headpose_pred_to_degree(x_info['yaw'])[:, None]
+            x_info['roll'] = headpose_pred_to_degree(x_info['roll'])[:, None]
+            x_info['kp'] = x_info['kp'].reshape(bs, -1, 3)
+            x_info['exp'] = x_info['exp'].reshape(bs, -1, 3)
+
+            x_t = self.transform_keypoint(x_info)                 # target keypoints
+            x_can = x_info['scale'][..., None] * x_info['kp']     # canonical keypoints
+
+            f_s = self.appearance_feature_extractor(I_d)
+            f_can, occ_map = self.warping_module.warp(f_s, x_t, x_can)
+
+            if source_id.shape[0] not in (1, bs):
+                raise ValueError(f'source_id batch {source_id.shape[0]} incompatible with frame batch {bs}')
+            f_can_swap = self.swap_module(f_can, source_id)
+
+            canonical = None
+            if need_canonical:
+                canonical = self.parse_output(self.conv_decode(f_can_swap, occ_map))
+
+            f_can_swap = self.refine_module(f_can_swap)
+            ret_dct = self.warping_module(f_can_swap, kp_source=x_can, kp_driving=x_t)
+            out = self.spade_generator(feature=ret_dct['out'])
+
+        return self.parse_output(out), canonical
 
     def calc_ratio(self, lmk_lst):
         input_eye_ratio_lst = []

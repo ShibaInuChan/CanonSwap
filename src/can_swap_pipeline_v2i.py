@@ -5,7 +5,8 @@ from skimage.draw import disk
 
 import matplotlib.pyplot as plt
 
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
+import cv2
+from .utils.cv2_config import configure_opencv; configure_opencv()
 import numpy as np
 import os
 import os.path as osp

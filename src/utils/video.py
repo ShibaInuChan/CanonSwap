@@ -47,6 +47,55 @@ def images2video(images, wfp, **kwargs):
     writer.close()
 
 
+class StreamingVideoWriter:
+    """Encode frames as they are produced instead of buffering the whole video.
+
+    ``images2video`` needs the complete frame list up front, which means a
+    full-resolution copy of every frame of the result has to be kept in RAM
+    (several GB for a 1080p clip) before encoding even starts.  This writer
+    takes the exact same encoder settings but accepts one frame at a time, so
+    the swap loop can hand each finished frame straight to ffmpeg and forget
+    about it.
+    """
+
+    def __init__(self, wfp, **kwargs):
+        fps = kwargs.get('fps', 30)
+        video_format = kwargs.get('format', 'mp4')
+        codec = kwargs.get('codec', 'libx264')
+        quality = kwargs.get('quality')
+        pixelformat = kwargs.get('pixelformat', 'yuv420p')
+        macro_block_size = kwargs.get('macro_block_size', 2)
+        ffmpeg_params = ['-crf', str(kwargs.get('crf', 18))]
+
+        self.image_mode = kwargs.get('image_mode', 'rgb')
+        self.wfp = wfp
+        self.n_written = 0
+        self.writer = imageio.get_writer(
+            wfp, fps=fps, format=video_format,
+            codec=codec, quality=quality, ffmpeg_params=ffmpeg_params,
+            pixelformat=pixelformat, macro_block_size=macro_block_size
+        )
+
+    def append(self, image):
+        if self.image_mode.lower() == 'bgr':
+            self.writer.append_data(image[..., ::-1])
+        else:
+            self.writer.append_data(image)
+        self.n_written += 1
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+
 def video2gif(video_fp, fps=30, size=256):
     if osp.exists(video_fp):
         d = osp.split(video_fp)[0]

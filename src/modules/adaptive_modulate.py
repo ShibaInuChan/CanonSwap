@@ -125,10 +125,46 @@ class AdaptiveSharedWeightConv2d(nn.Module):
         self.use_adaptive_norm = use_adaptive_norm
         if use_adaptive_norm:
             self.adaptive_norm = RegionAwareAdaptiveNorm(in_channels)
+    def _modulated_weight(self, latent):
+        """Style-modulated + demodulated conv weight, cached per latent.
+
+        The identity latent is constant for a whole video, so the modulated
+        weight it produces is constant too.  Recomputing it (a style MLP plus a
+        [L, outC, inC, kH, kW] multiply/reduce, ~2.4M elements per call here)
+        once per convolution per frame was pure overhead, so the result is
+        cached and reused as long as the very same latent tensor comes back
+        unmodified.
+        """
+        cached_latent = getattr(self, '_wmod_latent', None)
+        if (
+            cached_latent is not None
+            and cached_latent is latent
+            and self._wmod_version == latent._version
+            and self._wmod_weight_version == self.weight._version
+        ):
+            return self._wmod_cache
+
+        style = self.style_fc(latent)                # => [L, inC]
+        style = style.unsqueeze(-1).unsqueeze(-1)    # => [L, inC, 1, 1]
+
+        w = self.weight.unsqueeze(0)                 # => [1, outC, inC, kH, kW]
+        w_mod = w * style[:, None, :, :, :]          # => [L, outC, inC, kH, kW]
+
+        demod = torch.rsqrt((w_mod**2).sum(dim=(2,3,4), keepdim=True) + self.eps)
+        w_mod = w_mod * demod                        # => [L, outC, inC, kH, kW]
+
+        # NOTE: keeping a reference to the latent both keys the cache and makes
+        # sure its identity cannot be recycled by a later allocation.
+        self._wmod_latent = latent
+        self._wmod_version = latent._version
+        self._wmod_weight_version = self.weight._version
+        self._wmod_cache = w_mod
+        return w_mod
+
     def forward(self, x, latent, external_mask=None):
         """
         x: [N, inC, H, W]
-        latent: [N, latent_size]
+        latent: [N, latent_size] (or [1, latent_size], shared by the whole batch)
         external_mask: [N, 1, H, W] (可选)
 
         returns: (out, mask)   # mask 维度: [N,1,H,W]
@@ -145,26 +181,32 @@ class AdaptiveSharedWeightConv2d(nn.Module):
         )
 
         # 2) 调制卷积 out_mod
-        style = self.style_fc(latent)                # => [N, inC]
-        style = style.unsqueeze(-1).unsqueeze(-1)    # => [N, inC, 1, 1]
+        w_mod = self._modulated_weight(latent)       # => [L, outC, inC, kH, kW]
 
-        w = self.weight.unsqueeze(0)                 # => [1, outC, inC, kH, kW]
-        w_mod = w * style[:, None, :, :, :]          # => [N, outC, inC, kH, kW]
-
-        demod = torch.rsqrt((w_mod**2).sum(dim=(2,3,4), keepdim=True) + self.eps)
-        w_mod = w_mod * demod                        # => [N, outC, inC, kH, kW]
-
-        x_reshape = x.view(1, N*self.in_channels, H, W)
-        w_mod_reshape = w_mod.view(N*self.out_channels, self.in_channels, *self.kernel_size)
-        out_mod = F.conv2d(
-            x_reshape,
-            w_mod_reshape,
-            bias=None,
-            stride=self.stride,
-            padding=self.padding,
-            groups=N
-        )
-        out_mod = out_mod.view(N, self.out_channels, out_mod.shape[2], out_mod.shape[3])
+        if w_mod.shape[0] == 1:
+            # One latent shared by every frame in the batch: a plain convolution
+            # is mathematically identical to the grouped one below (every group
+            # would use the same kernel) but avoids materialising N copies of
+            # the weight and is far better optimised in cuDNN/MPS.
+            out_mod = F.conv2d(
+                x,
+                w_mod[0],
+                bias=None,
+                stride=self.stride,
+                padding=self.padding
+            )
+        else:
+            x_reshape = x.view(1, N*self.in_channels, H, W)
+            w_mod_reshape = w_mod.reshape(N*self.out_channels, self.in_channels, *self.kernel_size)
+            out_mod = F.conv2d(
+                x_reshape,
+                w_mod_reshape,
+                bias=None,
+                stride=self.stride,
+                padding=self.padding,
+                groups=N
+            )
+            out_mod = out_mod.view(N, self.out_channels, out_mod.shape[2], out_mod.shape[3])
 
         if self.bias_param is not None:
             out_mod = out_mod + self.bias_param.view(1, -1, 1, 1)

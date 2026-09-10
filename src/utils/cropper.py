@@ -3,7 +3,8 @@
 import os.path as osp
 import torch
 import numpy as np
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
+import cv2
+from .cv2_config import configure_opencv; configure_opencv()
 
 from PIL import Image
 from typing import List, Tuple, Union
@@ -66,6 +67,10 @@ class Cropper(object):
                     name="buffalo_l",
                     root=self.crop_cfg.insightface_root,
                     providers=face_analysis_wrapper_provider,
+                    # only these two are ever used; without this every other model
+                    # shipped in the buffalo_l pack (recognition, gender/age, 3d68)
+                    # is loaded at start-up and run on every detected face
+                    allowed_modules=["detection", "landmark_2d_106"],
                 )
         self.face_analysis_wrapper.prepare(ctx_id=device_id, det_size=(512, 512), det_thresh=self.crop_cfg.det_thresh)
         self.face_analysis_wrapper.warmup()

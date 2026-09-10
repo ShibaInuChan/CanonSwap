@@ -1,7 +1,8 @@
 # coding: utf-8
 
 import os.path as osp
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False)
+import cv2
+from .cv2_config import configure_opencv; configure_opencv()
 import torch
 import numpy as np
 import onnxruntime

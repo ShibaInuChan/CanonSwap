@@ -7,7 +7,8 @@ cropping function and the related preprocess functions for cropping
 import numpy as np
 import os.path as osp
 from math import sin, cos, acos, degrees
-import cv2; cv2.setNumThreads(0); cv2.ocl.setUseOpenCL(False) # NOTE: enforce single thread
+import cv2
+from .cv2_config import configure_opencv; configure_opencv()
 from .rprint import rprint as print
 
 import torch
@@ -36,15 +37,22 @@ class SoftErosion(torch.nn.Module):
 
     def forward(self, x):
         x = x.float()
+        weight = self.weight.to(dtype=x.dtype)
         for i in range(self.iterations - 1):
-            x = torch.min(x, F.conv2d(x, weight=self.weight, groups=x.shape[1], padding=self.padding))
-        x = F.conv2d(x, weight=self.weight, groups=x.shape[1], padding=self.padding)
+            x = torch.min(x, F.conv2d(x, weight=weight, groups=x.shape[1], padding=self.padding))
+        x = F.conv2d(x, weight=weight, groups=x.shape[1], padding=self.padding)
 
         mask = x >= self.threshold
-        x[mask] = 1.0
-        off_mask_max = x[~mask].max() if (~mask).any() else x.new_tensor(0.0)
-        if off_mask_max > 0:
-            x[~mask] = x[~mask] / off_mask_max
+        # NOTE: the previous implementation used boolean indexing plus a python-level
+        # `if off_mask_max > 0`, which forces a device->host synchronisation on every
+        # call (i.e. once per video frame). The formulation below is numerically
+        # identical -- values >= threshold become 1, the rest are divided by the
+        # largest sub-threshold value (a zero denominator leaves them untouched,
+        # since they are then all zero) -- but stays entirely on the device.
+        # The reduction is per sample so that a batch of masks gives exactly the
+        # same result as eroding each mask on its own.
+        off_mask_max = torch.amax(torch.where(mask, torch.zeros_like(x), x), dim=(1, 2, 3), keepdim=True)
+        x = torch.where(mask, torch.ones_like(x), x / off_mask_max.clamp_min(1e-12))
 
         return x, mask
 
